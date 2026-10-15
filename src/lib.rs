@@ -5,6 +5,7 @@
 
 pub mod intent;
 pub mod agent_scheduler;
+pub mod schedule_store;
 
 pub use intent::{
     Decision, ExecutionReceipt, Intent, IntentError, RiskLevel, RunOutcome,
@@ -12,4 +13,8 @@ pub use intent::{
 
 pub use agent_scheduler::{
     AgentSchedule, AgentScheduler, IntentRunner, ScheduleKind, SchedulerError,
+};
+
+pub use schedule_store::{
+    DependencyRow, GenerationState, ScheduleStore, StoreError, StoredSchedule,
 };
