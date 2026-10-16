@@ -3,12 +3,12 @@
 // and consumed edges (consume-once across restart).
 //
 // Backend: SQLite (sqlx). Survives process restarts.
+// Shared with Python MCP via OPERATORPAGES_DB (absolute path).
+//
+// Contract: PRAGMA user_version = 1, WAL, busy_timeout=5000, foreign_keys=ON
 //
 // Tables:
-//   schedules     – registered AgentSchedule definitions
-//   generations   – per-agent successful completion counts
-//   dependencies  – agent → depends_on + min_generation
-//   consumed      – consumer → producer → last_consumed_generation
+//   schedules, generations, dependencies, consumed
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,8 @@ use sqlx::{sqlite::SqlitePoolOptions, FromRow, SqlitePool};
 use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
+
+const SCHEMA_USER_VERSION: i64 = 1;
 
 #[derive(Error, Debug)]
 pub enum StoreError {
@@ -27,6 +29,8 @@ pub enum StoreError {
     NotFound(String),
     #[error("invalid dependency: {0}")]
     InvalidDependency(String),
+    #[error("schema version mismatch: {0}")]
+    SchemaVersion(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -62,12 +66,41 @@ pub struct ScheduleStore {
 }
 
 impl ScheduleStore {
+    /// Open (or create) the SQLite database at `path`.
+    /// Caller should pass an absolute path (see SHARED_DB.md / OPERATORPAGES_DB).
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let url = format!("sqlite:{}?mode=rwc", path.as_ref().display());
+        let path_ref = path.as_ref();
+        if !path_ref.is_absolute() {
+            return Err(StoreError::SchemaVersion(format!(
+                "database path must be absolute, got {}",
+                path_ref.display()
+            )));
+        }
+        let url = format!("sqlite:{}?mode=rwc", path_ref.display());
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect(&url)
             .await?;
+
+        sqlx::query("PRAGMA busy_timeout = 5000;")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA foreign_keys = ON;")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA journal_mode = WAL;")
+            .execute(&pool)
+            .await?;
+
+        let ver: (i64,) = sqlx::query_as("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?;
+        if ver.0 != 0 && ver.0 != SCHEMA_USER_VERSION {
+            return Err(StoreError::SchemaVersion(format!(
+                "schema user_version mismatch: db={} expected={}",
+                ver.0, SCHEMA_USER_VERSION
+            )));
+        }
 
         sqlx::query(
             r#"
@@ -111,6 +144,12 @@ impl ScheduleStore {
         )
         .execute(&pool)
         .await?;
+
+        if ver.0 == 0 {
+            sqlx::query("PRAGMA user_version = 1")
+                .execute(&pool)
+                .await?;
+        }
 
         Ok(Self { pool })
     }
