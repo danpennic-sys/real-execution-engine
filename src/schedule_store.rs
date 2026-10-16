@@ -1,12 +1,14 @@
 // schedule_store.rs
-// Durable persistence for schedules, generation counters, and dependencies.
+// Durable persistence for schedules, generation counters, dependencies,
+// and consumed edges (consume-once across restart).
 //
 // Backend: SQLite (sqlx). Survives process restarts.
 //
 // Tables:
 //   schedules     – registered AgentSchedule definitions
 //   generations   – per-agent successful completion counts
-//   dependencies  – agent → depends_on + min_generation (consume-once)
+//   dependencies  – agent → depends_on + min_generation
+//   consumed      – consumer → producer → last_consumed_generation
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -27,18 +29,12 @@ pub enum StoreError {
     InvalidDependency(String),
 }
 
-// ---------------------------------------------------------------------------
-// Stored rows
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct StoredSchedule {
     pub id: String,
     pub agent_id: String,
     pub group_name: Option<String>,
-    /// "cron" | "interval" | "once"
     pub kind: String,
-    /// cron expression or duration in seconds (as string)
     pub expression: String,
     pub max_concurrent: i64,
     pub enabled: bool,
@@ -61,16 +57,11 @@ pub struct DependencyRow {
     pub min_generation: i64,
 }
 
-// ---------------------------------------------------------------------------
-// Store
-// ---------------------------------------------------------------------------
-
 pub struct ScheduleStore {
     pool: SqlitePool,
 }
 
 impl ScheduleStore {
-    /// Open (or create) the SQLite database at `path`.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let url = format!("sqlite:{}?mode=rwc", path.as_ref().display());
         let pool = SqlitePoolOptions::new()
@@ -106,8 +97,16 @@ impl ScheduleStore {
                 PRIMARY KEY (agent_id, depends_on)
             );
 
+            CREATE TABLE IF NOT EXISTS consumed (
+                consumer_agent_id   TEXT NOT NULL,
+                producer_agent_id   TEXT NOT NULL,
+                last_generation     INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (consumer_agent_id, producer_agent_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_sched_agent ON schedules(agent_id);
             CREATE INDEX IF NOT EXISTS idx_dep_agent   ON dependencies(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_consumed_consumer ON consumed(consumer_agent_id);
             "#,
         )
         .execute(&pool)
@@ -115,8 +114,6 @@ impl ScheduleStore {
 
         Ok(Self { pool })
     }
-
-    // ---------- Schedules ----------
 
     pub async fn upsert_schedule(&self, s: &StoredSchedule) -> Result<(), StoreError> {
         sqlx::query(
@@ -176,8 +173,6 @@ impl ScheduleStore {
         Ok(())
     }
 
-    // ---------- Generations (consume-once) ----------
-
     pub async fn get_completed(&self, agent_id: &str) -> Result<u64, StoreError> {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT completed_count FROM generations WHERE agent_id = ?",
@@ -185,12 +180,9 @@ impl ScheduleStore {
         .bind(agent_id)
         .fetch_optional(&self.pool)
         .await?;
-
         Ok(row.map(|r| r.0 as u64).unwrap_or(0))
     }
 
-    /// Atomically increment the successful-completion counter for `agent_id`.
-    /// Returns the new count.
     pub async fn mark_success(&self, agent_id: &str) -> Result<u64, StoreError> {
         let now = Utc::now();
         sqlx::query(
@@ -206,11 +198,8 @@ impl ScheduleStore {
         .bind(now)
         .execute(&self.pool)
         .await?;
-
         self.get_completed(agent_id).await
     }
-
-    // ---------- Dependencies ----------
 
     pub async fn add_dependency(
         &self,
@@ -223,7 +212,6 @@ impl ScheduleStore {
                 "self-dependency not allowed".into(),
             ));
         }
-
         sqlx::query(
             r#"
             INSERT INTO dependencies (agent_id, depends_on, min_generation)
@@ -250,7 +238,6 @@ impl ScheduleStore {
         .bind(agent_id)
         .fetch_all(&self.pool)
         .await?;
-
         Ok(rows.into_iter().map(|(k, v)| (k, v as u64)).collect())
     }
 
@@ -269,7 +256,6 @@ impl ScheduleStore {
         Ok(())
     }
 
-    /// Returns true when every declared dependency has completed_count >= required min_generation.
     pub async fn dependencies_satisfied(&self, agent_id: &str) -> Result<bool, StoreError> {
         let deps = self.get_dependencies(agent_id).await?;
         for (dep, min_gen) in deps {
@@ -279,5 +265,67 @@ impl ScheduleStore {
             }
         }
         Ok(true)
+    }
+
+    pub async fn set_consumed(
+        &self,
+        consumer_agent_id: &str,
+        producer_agent_id: &str,
+        generation: u64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO consumed (consumer_agent_id, producer_agent_id, last_generation)
+            VALUES (?, ?, ?)
+            ON CONFLICT(consumer_agent_id, producer_agent_id) DO UPDATE SET
+                last_generation = CASE
+                    WHEN excluded.last_generation > last_generation
+                    THEN excluded.last_generation
+                    ELSE last_generation
+                END
+            "#,
+        )
+        .bind(consumer_agent_id)
+        .bind(producer_agent_id)
+        .bind(generation as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_consumed(
+        &self,
+        consumer_agent_id: &str,
+        producer_agent_id: &str,
+    ) -> Result<u64, StoreError> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT last_generation FROM consumed
+            WHERE consumer_agent_id = ? AND producer_agent_id = ?
+            "#,
+        )
+        .bind(consumer_agent_id)
+        .bind(producer_agent_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0 as u64).unwrap_or(0))
+    }
+
+    pub async fn load_all_consumed(
+        &self,
+    ) -> Result<HashMap<String, HashMap<String, u64>>, StoreError> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT consumer_agent_id, producer_agent_id, last_generation FROM consumed",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out: HashMap<String, HashMap<String, u64>> = HashMap::new();
+        for (consumer, producer, gen) in rows {
+            out.entry(consumer)
+                .or_default()
+                .insert(producer, gen as u64);
+        }
+        Ok(out)
     }
 }
